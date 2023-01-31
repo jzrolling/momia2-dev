@@ -1,5 +1,6 @@
 import PIL as pl
 import numpy as np
+from skimage.io import imshow,imread
 import nd2reader as nd2
 import tifffile as tf
 import os,glob,pickle as pk
@@ -10,7 +11,8 @@ __all__ = ['sort2folder',
            'softread_file',
            'get_slice_by_index',
            'get_slice_by_index',
-           'load_softread']
+           'load_softread',
+           'imread','imshow' ]
 
 def sort2folder(src_folder):
     """

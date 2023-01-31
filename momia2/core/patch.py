@@ -71,16 +71,26 @@ class Patch:
             self.config = config
         else:
             self.config = Config(config).config
-            
-    def preprocess_images(self, optimizers=[]):
-        for opt in optimizers:
-            opt.optimize(self)
-    
+
     def load_seed(self,seed):
         if seed.shape != self.shape:
             raise ValueError("The shapes of seed image and target images don't match!")
         self.seed = seed
-       
+
+    def load_mask(self,mask):
+        if mask.shape != self.shape:
+            raise ValueError("The shapes of mask image and target images don't match!")
+        self.mask = mask
+
+    def load_labeled_mask(self,labeled_mask):
+        if labeled_mask.shape != self.shape:
+            raise ValueError("The shapes of labeled mask and target images don't match!")
+        self.labeled_mask = labeled_mask
+            
+    def preprocess_images(self, optimizers=[]):
+        for opt in optimizers:
+            opt.optimize(self)
+
     def crop_edge(self):
         cropped = float(self.config['image']['crop_edge'])
 
@@ -97,7 +107,7 @@ class Patch:
         for channel, data in self.data.items():
             self.data[channel] = self.data[channel][h1:h2, w1:w2]
     
-    def correct_xy_drift(self, reference_channel = 'default'):
+    def correct_xy_drift(self, reference_channel = 'default',mode='individual',invert_reference=False):
         from skimage import registration
         
         # define max drift in pixel unit
@@ -179,11 +189,12 @@ class Patch:
                                       connectivity=1,
                                       compactness=0.1,
                                       watershed_line=True)
-        
+
     def locate_particles(self, 
                          use_intensity=True, 
                          precompute_contours=False, 
-                         contour_kwargs={'level':0.1, 'dilation':True}):
+                         contour_kwargs={'level':0.1,
+                                         'dilation':True}):
         if self.labeled_mask.max()>0:
             if use_intensity:
                 self.regionprops=get_regionprop(self.labeled_mask, intensity_image=self.get_ref_image())
@@ -202,18 +213,27 @@ class Patch:
             self.regionprops['$mask'] = masks
             if precompute_contours:
                 self._find_contours(**contour_kwargs)
+
     
     def refine_contours(self,
                         angularity_window=15,
-                        update_mask=False,**kwargs):
-        sobel_edge = sobel(self.get_ref_image())
+                        update_mask=False,
+                        edge_mode = 'sobel',
+                        **kwargs):
+        if edge_mode == 'sobel':
+            edge = sobel(self.get_ref_image())
+        elif edge_mode == 'sato':
+            edge = sato(self.get_ref_image(),sigmas=(0.8),black_ridges=False)
+        elif edge_mode == 'composite':
+            edge = sobel(sato(self.get_ref_image(), sigmas=(0.8), black_ridges=False))
+
         contours = []
         refined_masks = []
         bending_stat = []
         refined_coords = []
         for i in self.regionprops.index:
             x1,y1,x2,y2,c,mask= self.regionprops.loc[i,['$opt-x1', '$opt-y1', '$opt-x2', '$opt-y2','$contours','$mask']].values
-            target = sobel_edge[x1:x2,y1:y2]
+            target = edge[x1:x2,y1:y2]
             refined = contour.optimize_contour(c,target,**kwargs)
             if len(refined)>0:
                 contours.append(refined)
@@ -236,21 +256,27 @@ class Patch:
                           'max_positive_curvature',
                           'mean_curvature','Q1_curvature','Q3_curvature']] = bending_stat
         
-    def extract_midlines(self,aspect_cutoff=0.5,tol=0.5,contour_key='$refined_contours',approximate=True):
+    def extract_midlines(self,
+                         aspect_cutoff=0.5,
+                         solidity_cutoff = 0.75,
+                         tol=0.5,
+                         contour_key='$refined_contours',
+                         approximate=False,
+                         min_branch_length=5):
         midlines = []
         widths = []
         width_stats = []
         lengths = []
         for i in self.regionprops.index:
-            x1,y1,x2,y2,contour,mask,ori,aspect= self.regionprops.loc[i,['$opt-x1', '$opt-y1', '$opt-x2', '$opt-y2',
-                                                                          contour_key,'$mask','orientation','aspect_ratio']].values
+            x1,y1,x2,y2,contour,mask,ori,aspect,solidity = self.regionprops.loc[i,['$opt-x1', '$opt-y1', '$opt-x2', '$opt-y2',
+                                                                          contour_key,'$mask','orientation','aspect_ratio','solidity']].values
             if approximate:
                 approx_contour = approximate_polygon(contour[0], tolerance=tol)
             else:
                 approx_contour = contour[0]
             try:
-                if aspect<aspect_cutoff:
-                    midline = skeleton.mask2midline(mask,approx_contour,ellipse_fast=False)
+                if (aspect<aspect_cutoff) or (solidity<solidity_cutoff):
+                    midline = skeleton.mask2midline(mask,approx_contour,ellipse_fast=False,min_branch_length=min_branch_length)
                 else:
                     midline = skeleton.mask2midline(mask,approx_contour,ellipse_fast=True,orientation=ori)
             except:
@@ -290,8 +316,7 @@ class Patch:
             
         # omit empty items
         for k in ['$refined_contours',
-                  '$midlines',
-                  '$widths']:
+                  '$midlines']:
             if k in self.regionprops:
                 _accept.append(np.array([1 if len(x)>0 else 0 for x in self.regionprops[k].values]))
                 
@@ -392,7 +417,14 @@ class Patch:
                        filename=None):
         return None
     
-    def _find_contours(self, level=0.1, dilation=False, erosion=True):
+    def _find_contours(self,
+                       use_seed=None,
+                       level=0.1,
+                       dilation=False,
+                       erosion=True,
+                       dark_background=False,
+                       gaussian_smooth_sigma=1):
+
         if len(self.regionprops)>0:
             contour_list = []
             n_contours = []
@@ -403,12 +435,17 @@ class Patch:
                 x1,y1,x2,y2 = self.regionprops.loc[label][['$opt-x1','$opt-y1','$opt-x2','$opt-y2']].values.astype(int)
                 mask = (self.labeled_mask[x1:x2,y1:y2]==label).astype(np.int32)
                 mask = ndi.median_filter(mask,2)>0.5
-                data = self.get_ref_image()[x1:x2,y1:y2]
+                if use_seed:
+                    data = self.prob_mask[x1:x2,y1:y2,2]
+                else:
+                    data = self.get_ref_image()[x1:x2,y1:y2]
                 contours = contour.find_contour_marching_squares(data, 
                                                                  mask,
                                                                  level=level,
                                                                  dilation=dilation,
-                                                                 erosion=erosion)
+                                                                 erosion=erosion,
+                                                                 dark_background=dark_background,
+                                                                 gaussian_smooth_sigma=gaussian_smooth_sigma)
                 n_contours.append(len(contours))
                 contour_list.append(contours)
             self.regionprops['n_contours'] = n_contours
@@ -440,11 +477,13 @@ class Patch:
             for i in cell_ids:
                 fig=plt.figure(figsize=figsize)
                 if i in self.regionprops.index:
-                    x1,y1,x2,y2,contour,midlines= self.regionprops.loc[i,['$opt-x1', '$opt-y1', '$opt-x2', '$opt-y2',
-                                                                       '$refined_contours','$midlines']].values
+                    x1,y1,x2,y2,contour,midlines,raw_contours= self.regionprops.loc[i,['$opt-x1', '$opt-y1', '$opt-x2', '$opt-y2',
+                                                                       '$refined_contours','$midlines','$contours']].values
                     plt.imshow(img[x1:x2,y1:y2],cmap='gist_gray')
                     if len(contour)>0:
                         plt.plot(contour[0][:,1],contour[0][:,0],color=contour_color,lw=contour_lw,ls=contour_ls)
+                    else:
+                        plt.plot(raw_contours[0][:,1],raw_contours[0][:,0],color=contour_color,lw=contour_lw,ls=contour_ls)
                     if len(midlines)>0:
                         plt.plot(midlines[:,1],midlines[:,0],color=midline_color,lw=midline_lw,ls=midline_ls)
         else:
@@ -452,10 +491,12 @@ class Patch:
             plt.imshow(img,cmap='gist_gray')
             for i in cell_ids:
                 if i in self.regionprops.index:
-                    x1,y1,x2,y2,contour,midlines= self.regionprops.loc[i,['$opt-x1', '$opt-y1', '$opt-x2', '$opt-y2',
-                                                                       '$refined_contours','$midlines']].values
+                    x1,y1,x2,y2,contour,midlines,raw_contours= self.regionprops.loc[i,['$opt-x1', '$opt-y1', '$opt-x2', '$opt-y2',
+                                                                       '$refined_contours','$midlines','$contours']].values
                     if len(contour)>0:
                         plt.plot(contour[0][:,1]+y1,contour[0][:,0]+x1,color=contour_color,lw=contour_lw,ls=contour_ls)
+                    else:
+                        plt.plot(raw_contours[0][:,1]+y1,raw_contours[0][:,0]+x1,color=contour_color,lw=contour_lw,ls=contour_ls)
                     if len(midlines)>0:
                         plt.plot(midlines[:,1]+y1,midlines[:,0]+x1,color=midline_color,lw=midline_lw,ls=midline_ls)
     
@@ -567,7 +608,7 @@ class Patch:
             annotation = self.regionprops['$annotation'].values
         else:
             annotation = np.zeros(len(self.regionprops))
-        for (x0,y0,x1,y1,c) in self.regionprops[['$opt-x1','$opt-y1','$opt-x2','$opt-y2','$opt-contours']].values:
+        for (x0,y0,x1,y1,c) in self.regionprops[['$opt-x1','$opt-y1','$opt-x2','$opt-y2','$contours']].values:
             if show_contour:
                 fig=plt.figure(figsize=(4,4))
                 plt.imshow(self.get_ref_image()[x0:x1,y0:y1],cmap='gist_gray')
