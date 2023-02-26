@@ -2,6 +2,9 @@ import numpy as np
 from skimage import morphology, filters, measure
 
 
+def dict2list(dict_f):
+    return [[k,v] for k,v in dict_f.items()]
+
 def config2selem(config_str):
     selem_list = config_str.split(',')
     if len(selem_list)!=3:
