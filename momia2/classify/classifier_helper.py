@@ -8,7 +8,7 @@ from skimage import measure
 from ..utils import linalg
 
 __all__ = ['roi2multilabel','roi2multimasks','prediction2seed','prediction2foreground','np_method',
-           'image2patches','generate_patch_coords','normalize_image','dist2labels_simp']
+           'Patchifier','normalize_image','dist2labels_simp']
 
 def roi2multilabel(roi_file,image_shape,dst,erosion_radius=2,subdivide_degree = 2):
     import read_roi as rr
@@ -127,17 +127,13 @@ def np_method(data,method='mean',**kwargs):
         print('method not found, use np.mean instead')
         return np.mean(data,**kwargs)
               
-def image2predict(img,model,size=256,channels=3,pad=16):
-    img = pad_nonzero(img,size)
-    canvas = np.zeros(list(img.shape)+[channels])
-    coords = generate_patch_coords(img,patch_size=size,pad=pad)
-    patches = np.expand_dims(np.array([img[x:x+size,y:y+size] for x,y,_k in coords]),-1)
-    pred = model.predict(patches,batch_size=5)
-    for p,(x,y,_k) in zip(pred,coords):
-        for c in range(channels):
-            canvas[x:x+size,y:y+size,c] = np.array([canvas[x:x+size,y:y+size,c],
-                                                    p[:,:,c]]).max(axis=0)
-    return canvas,patches,pred 
+def image2predict(img,model,size=256,channels=3,pad=16,batch_size=5):
+    shape = img.shape[:2]
+    patchifier = Patchifier(shape,size,pad)
+    patches = patchifier.pachify(img)
+    pred = model.predict(patches, batch_size=batch_size)
+    stitched = patchifier.unpatchify(pred,channels)
+    return stitched
 
 def pad_nonzero(img,size):
     h = max(img.shape[0],size)
@@ -145,29 +141,6 @@ def pad_nonzero(img,size):
     canvas=np.zeros((h,w))
     canvas[:img.shape[0],:img.shape[1]] = img
     return canvas
-
-
-def image2patches(img,mask,size=128,pad=16):
-    #if img.shape[:2] != mask.shape[:2]:
-    #    raise ValueError("The shapes of image and mask don't match!")
-    coords = generate_patch_coords(img,pad=pad,patch_size=size)
-    image_patches=[]
-    mask_patches=[]
-    for x,y,t in coords:
-        p_image = img[x:x+size,y:y+size]
-        p_mask = mask[x:x+size,y:y+size]
-        image_patches.append(p_image)
-        mask_patches.append(p_mask)
-    return np.array(image_patches), np.array(mask_patches), coords
-
-
-def generate_patch_coords(img,pad=32,patch_size=128):
-    h,w = img.shape
-    xs = list(np.arange(0,h-patch_size,patch_size-2*pad))+[h-patch_size]
-    ys = list(np.arange(0,w-patch_size,patch_size-2*pad))+[w-patch_size]
-    ref_coords = np.array([[x,y,np.random.randint(2)] for x in xs for y in ys])
-    return ref_coords
-
 
 def normalize_image(img,
                     mask=None,
@@ -218,3 +191,89 @@ def normalize_image(img,
             img = img**(np.log(bg)/np.log(np.mean(img[morphology.binary_erosion(mask==0)])))
         
     return img
+
+
+class Patchifier:
+    """
+    A simple way to convert 2D images to patches and stitch them back into one
+    Currently it only works with images with shapes like (height, width) or (height, width, channel), it doesn't work
+    on image series such as (frame, height, width, channel)
+    The smoothing function for overlap edges is simply the mean values of the overlapping pixels. Future updates may
+    consider implementing 2D spline interpolation based smoothing method, such as:
+    https://github.com/bnsreenu/python_for_microscopists/blob/master/229_smooth_predictions_by_blending_patches/smooth_tiled_predictions.py
+    """
+
+    def __init__(self, img_shape=(512, 512), patch_size=128, pad=32):
+
+        """
+        :param img_shape: the original shape of the large input image
+        :param patch_size: the height and width of the square-shaped patch
+        :param pad: half-width of the overlapping region of neighboring patches
+        """
+
+        self._shape = img_shape
+        self.size = patch_size
+        self.pad = pad
+        self.shape = (max(self._shape[0], self.size),
+                      max(self._shape[1], self.size))
+        self.pad_h = max(0, self.size - self._shape[0])
+        self.pad_w = max(0, self.size - self._shape[1])
+        self.ref_coords = self.generate_patch_coords()
+
+    def generate_patch_coords(self):
+        """
+        funtion to generate patch coords
+        :return:
+        """
+        h, w = self.shape
+        xs = list(np.arange(0, h - self.size, self.size - 2 * self.pad)) + [h - self.size]
+        if len(xs) > 1:
+            if xs[-1] == xs[-2]:
+                xs = xs[:-1]
+        ys = list(np.arange(0, w - self.size, self.size - 2 * self.pad)) + [w - self.size]
+        if len(ys) > 1:
+            if ys[-1] == ys[-2]:
+                ys = ys[:-1]
+        ref_coords = np.array([[x, y, np.random.randint(2)] for x in xs for y in ys])
+        return ref_coords
+
+    def pachify(self, img, random_rotate=False):
+        """
+        convert img to patches
+        :param img: src image
+        :param random_rotate: if randomly rotate clips, this shouldn't be used for prediction but can be helpful for training
+        :return: clipped patches
+        """
+        if self.shape != img.shape[:2]:
+            self.__init__(img.shape[:2])
+        pad_config = np.zeros((len(img.shape), 2))
+        pad_config[0][1] = self.pad_h
+        pad_config[1][1] = self.pad_w
+        pad_config = pad_config.astype(int)
+        if self.pad_h > 0 or self.pad_w > 0:
+            padded_img = np.pad(img.copy(), pad_config, mode='constant')
+        else:
+            padded_img = img.copy()
+        patches = []
+        for x, y, t in self.ref_coords:
+            p = padded_img[x:x + self.size, y:y + self.size]
+            if random_rotate and t:
+                p = p.T
+            patches.append(p)
+        return np.array(patches)
+
+    def unpatchify(self, patches, n_channel):
+        """
+        stitch patches back into one
+        :param patches: array of patches
+        :param n_channel: number of channels, for instance, for a rgb image n_channel should be 3
+        :return:
+        """
+        canvas = np.zeros(list(self.shape) + [n_channel])
+        canvas_counter = np.zeros(self.shape)
+        for i, p in enumerate(patches):
+            x, y = self.ref_coords[i][0], self.ref_coords[i][1]
+            canvas[x:x + self.size, y:y + self.size] += p
+            canvas_counter[x:x + self.size, y:y + self.size] += 1
+        mean_canvas = canvas / canvas_counter[:, :, np.newaxis]
+        return mean_canvas[:self._shape[0], :self._shape[1]]
